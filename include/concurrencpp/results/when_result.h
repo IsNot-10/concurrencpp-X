@@ -54,6 +54,7 @@ namespace concurrencpp::details {
 
         template<class... types>
         static size_t size(std::tuple<types...>& tuple) noexcept {
+            (void)tuple;  // 消除未使用参数警告
             return std::tuple_size_v<std::tuple<types...>>;
         }
 
