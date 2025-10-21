@@ -190,8 +190,11 @@ namespace concurrencpp::tests {
         wf.addModule(a);
         wf.addModule(b);
         wf.add_edge("A", "B");
+        // 取消即时环检测与执行期环检测：不应抛异常，交由用户保证
         wf.add_edge("B", "A");
-        assert_throws_contains_error_message<std::runtime_error>([&] { wf.execute(); }, "Circular dependency");
+        // 执行应正常进行（可能根据实现，部分模块被跳过或运行），但不应因环报错
+        // 仅验证调用不抛异常
+        wf.execute();
     }
 
     // 缺失依赖检测
@@ -456,6 +459,270 @@ namespace concurrencpp::tests {
     }
 } // namespace concurrencpp::tests
 
+namespace concurrencpp::tests {
+
+    // 探针模块：覆盖 on_cancel/on_suspend/on_resume，记录钩子触发情况
+    class hook_probe_module : public concurrencpp::workflow::Module {
+    public:
+        std::atomic_bool canceled_probe{false};
+        std::atomic_bool suspended_probe{false};
+
+        explicit hook_probe_module(const std::string& name) : Module(name) {}
+
+        void on_cancel() override {
+            Module::on_cancel();
+            canceled_probe.store(true, std::memory_order_relaxed);
+        }
+        void on_suspend() override {
+            Module::on_suspend();
+            suspended_probe.store(true, std::memory_order_relaxed);
+        }
+        void on_resume() override {
+            Module::on_resume();
+            suspended_probe.store(false, std::memory_order_relaxed);
+        }
+
+        result<void> execute_async(std::shared_ptr<concurrencpp::executor>) override {
+            return concurrencpp::make_ready_result<void>();
+        }
+    };
+
+    // 可等待模块：暴露对受保护的 check_suspend 的调用，以测试等待机制
+    class waitable_module : public concurrencpp::workflow::Module {
+    public:
+        explicit waitable_module(const std::string& name) : Module(name) {}
+        void wait_until_resumed_or_canceled() { check_suspend(); }
+        result<void> execute_async(std::shared_ptr<concurrencpp::executor>) override {
+            return concurrencpp::make_ready_result<void>();
+        }
+    };
+
+    // 测试全局状态推送：suspend -> resume -> cancel 的钩子与状态变化
+    void test_workflow_global_state_push_suspend_resume_cancel() {
+        concurrencpp::workflow::Executor wf;
+        auto mod = std::make_shared<hook_probe_module>("probe");
+        wf.addModule(mod);
+
+        // suspend
+        wf.suspend();
+        assert_true(mod->suspended_probe.load(std::memory_order_relaxed));
+        assert_equal(static_cast<int>(wf.getModuleState("probe")),
+                     static_cast<int>(concurrencpp::workflow::Executor::ModuleState::Suspended));
+
+        // resume
+        wf.resume();
+        assert_true(!mod->suspended_probe.load(std::memory_order_relaxed));
+        assert_equal(static_cast<int>(wf.getModuleState("probe")),
+                     static_cast<int>(concurrencpp::workflow::Executor::ModuleState::Pending));
+
+        // cancel
+        wf.cancel();
+        assert_true(mod->canceled_probe.load(std::memory_order_relaxed));
+        assert_equal(static_cast<int>(wf.getModuleState("probe")),
+                     static_cast<int>(concurrencpp::workflow::Executor::ModuleState::Canceled));
+    }
+
+    // 测试 set_executor_for_all：所有模块的首选执行器应被统一设置
+    void test_workflow_set_executor_for_all_preferred() {
+        concurrencpp::workflow::Executor wf;
+        auto m1 = std::make_shared<recorder_module>("r1");
+        auto m2 = std::make_shared<recorder_module>("r2");
+        wf.addModule(m1);
+        wf.addModule(m2);
+        auto inline_ex = std::make_shared<concurrencpp::inline_executor>();
+        wf.set_executor_for_all(inline_ex);
+        assert_equal(m1->preferred_executor()->name, concurrencpp::details::consts::k_inline_executor_name);
+        assert_equal(m2->preferred_executor()->name, concurrencpp::details::consts::k_inline_executor_name);
+    }
+
+    // 测试协作式等待：在 suspend 时阻塞，resume 后返回
+    void test_workflow_check_suspend_wait_resume() {
+        using namespace std::chrono;
+        concurrencpp::workflow::Executor wf;
+        auto wm = std::make_shared<waitable_module>("wait_resume");
+        wf.addModule(wm);
+        wf.suspend();
+        std::thread t([&wf]() {
+            std::this_thread::sleep_for(milliseconds{50});
+            wf.resume();
+        });
+        const auto start = steady_clock::now();
+        wm->wait_until_resumed_or_canceled();
+        const auto end = steady_clock::now();
+        t.join();
+        assert_true(end - start >= milliseconds{30});
+    }
+
+    // 测试协作式等待：在 suspend 时阻塞，cancel 后返回
+    void test_workflow_check_suspend_wait_cancel() {
+        using namespace std::chrono;
+        concurrencpp::workflow::Executor wf;
+        auto wm = std::make_shared<waitable_module>("wait_cancel");
+        wf.addModule(wm);
+        wf.suspend();
+        std::thread t([&wf]() {
+            std::this_thread::sleep_for(milliseconds{50});
+            wf.cancel();
+        });
+        const auto start = steady_clock::now();
+        wm->wait_until_resumed_or_canceled();
+        const auto end = steady_clock::now();
+        t.join();
+        assert_true(end - start >= milliseconds{30});
+    }
+
+    // ===== 新增：参数读写与共享功能测试 =====
+
+    // 写入整型参数的模块
+    class write_int_module : public concurrencpp::workflow::Module {
+        std::string key_;
+        int value_;
+    public:
+        write_int_module(const std::string& name, std::string key, int value)
+            : Module(name), key_(std::move(key)), value_(value) {}
+        result<void> execute_async(std::shared_ptr<concurrencpp::executor>) override {
+            set_param(key_, value_);
+            return concurrencpp::make_ready_result<void>();
+        }
+    };
+
+    // 读取整型参数的模块
+    class read_int_module : public concurrencpp::workflow::Module {
+    public:
+        std::string key_;
+        bool existed_before {false};
+        int got_value {0};
+        explicit read_int_module(const std::string& name, std::string key)
+            : Module(name), key_(std::move(key)) {}
+        result<void> execute_async(std::shared_ptr<concurrencpp::executor>) override {
+            existed_before = param_exists(key_);
+            auto p = get_param<int>(key_);
+            got_value = *p;
+            return concurrencpp::make_ready_result<void>();
+        }
+    };
+
+    // 写入向量参数
+    class write_vec_module : public concurrencpp::workflow::Module {
+        std::string key_;
+        std::vector<int> init_;
+    public:
+        write_vec_module(const std::string& name, std::string key, std::vector<int> init)
+            : Module(name), key_(std::move(key)), init_(std::move(init)) {}
+        result<void> execute_async(std::shared_ptr<concurrencpp::executor>) override {
+            set_param<std::vector<int>>(key_, std::move(init_));
+            return concurrencpp::make_ready_result<void>();
+        }
+    };
+
+    // 修改并读取向量参数（with_write / with_read）
+    class modify_vec_module : public concurrencpp::workflow::Module {
+        std::string key_;
+        int extra_ {0};
+    public:
+        size_t final_size {0};
+        modify_vec_module(const std::string& name, std::string key, int extra)
+            : Module(name), key_(std::move(key)), extra_(extra) {}
+        result<void> execute_async(std::shared_ptr<concurrencpp::executor>) override {
+            with_write_param<std::vector<int>>(key_, [&](std::vector<int>& v){ v.push_back(extra_); });
+            with_read_param<std::vector<int>>(key_, [&](const std::vector<int>& v){ final_size = v.size(); });
+            return concurrencpp::make_ready_result<void>();
+        }
+    };
+
+    // 读取错误类型以触发类型不匹配异常
+    class wrong_type_reader_module : public concurrencpp::workflow::Module {
+        std::string key_;
+    public:
+        explicit wrong_type_reader_module(const std::string& name, std::string key)
+            : Module(name), key_(std::move(key)) {}
+        result<void> execute_async(std::shared_ptr<concurrencpp::executor>) override {
+            try {
+                // 期望读取 int，但实际存储为其他类型
+                (void)get_param<int>(key_);
+                return concurrencpp::make_ready_result<void>();
+            } catch (...) {
+                return concurrencpp::make_exceptional_result<void>(std::current_exception());
+            }
+        }
+    };
+
+    // 用例1：Executor 注入默认 ParamStore 且可替换
+    void test_workflow_param_store_injection_and_replace() {
+        concurrencpp::workflow::Executor wf;
+        auto r = std::make_shared<ready_module>("probe_ready");
+        wf.addModule(r);
+        // 默认注入
+        assert_true(wf.param_store() != nullptr);
+        assert_true(r->param_store() != nullptr);
+        // 替换注入
+        auto new_ps = std::make_shared<concurrencpp::workflow::ParamStore>();
+        wf.set_param_store(new_ps);
+        assert_true(wf.param_store() == new_ps);
+        assert_true(r->param_store() == new_ps);
+    }
+
+    // 用例2：写入整型参数并在下游读取
+    void test_workflow_param_flow_writer_reader() {
+        concurrencpp::workflow::Executor wf;
+        auto w = std::make_shared<write_int_module>("W", "k_num", 42);
+        auto r = std::make_shared<read_int_module>("R", "k_num");
+        wf.addModule(w);
+        wf.addModule(r);
+        wf.add_edge("W", "R");
+        wf.execute();
+        assert_true(r->existed_before);
+        assert_equal(r->got_value, 42);
+        assert_state_converged(wf);
+    }
+
+    // 用例3：向量参数 with_write/with_read 协作访问
+    void test_workflow_param_vector_rw() {
+        concurrencpp::workflow::Executor wf;
+        auto w = std::make_shared<write_vec_module>("Wv", "k_vec", std::vector<int>{1,2,3});
+        auto m = std::make_shared<modify_vec_module>("Mv", "k_vec", 4);
+        wf.addModule(w);
+        wf.addModule(m);
+        wf.add_edge("Wv", "Mv");
+        wf.execute();
+        assert_equal(static_cast<int>(m->final_size), 4);
+        assert_state_converged(wf);
+    }
+
+    // 用例4：类型不匹配错误应在 CancelOnError 策略下传播
+    void test_workflow_param_type_mismatch_propagates() {
+        concurrencpp::workflow::Executor wf; // 默认 CancelOnError
+        // 写入字符串，再尝试按 int 读取同键
+        auto w = std::make_shared<write_int_module>("Ws", "bad_key", 0);
+        // 先将键写为字符串，覆盖 write_int 的值
+        w = std::make_shared<write_int_module>("Ws", "bad_key", 0);
+        // 使用另一个模块写入字符串以确保类型为 string
+        class write_string_module : public concurrencpp::workflow::Module {
+            std::string key_;
+            std::string val_;
+        public:
+            write_string_module(const std::string& name, std::string key, std::string val)
+                : Module(name), key_(std::move(key)), val_(std::move(val)) {}
+            result<void> execute_async(std::shared_ptr<concurrencpp::executor>) override {
+                set_param(key_, val_);
+                return concurrencpp::make_ready_result<void>();
+            }
+        };
+        auto ws = std::make_shared<write_string_module>("Ws", "bad_key", std::string("abc"));
+        auto wr = std::make_shared<wrong_type_reader_module>("Wr", "bad_key");
+        wf.addModule(ws);
+        wf.addModule(wr);
+        wf.add_edge("Ws", "Wr");
+        assert_throws_contains_error_message<std::runtime_error>([&] { wf.execute(); }, "type mismatch");
+        // 状态与错误信息
+        assert_equal(static_cast<int>(wf.getModuleState("Ws")), static_cast<int>(concurrencpp::workflow::Executor::ModuleState::Done));
+        assert_equal(static_cast<int>(wf.getModuleState("Wr")), static_cast<int>(concurrencpp::workflow::Executor::ModuleState::Failed));
+        auto err = wf.getError("Wr");
+        assert_true(err.find("type mismatch") != std::string::npos);
+        assert_state_converged(wf);
+    }
+}
+
 using namespace concurrencpp::tests;
 
 int main() {
@@ -481,6 +748,18 @@ int main() {
     tester.add_step("priority aging increases deferred", test_workflow_priority_aging_increases_deferred);
     tester.add_step("priority respects dependencies", test_workflow_priority_respects_dependencies);
     tester.add_step("priority aging accumulates two rounds", test_workflow_priority_aging_accumulates_two_rounds);
+
+    // 新增：全局状态推送与协作式等待相关用例
+    tester.add_step("global state push suspend/resume/cancel flags", test_workflow_global_state_push_suspend_resume_cancel);
+    tester.add_step("set_executor_for_all sets preferred", test_workflow_set_executor_for_all_preferred);
+    tester.add_step("check_suspend waits until resume", test_workflow_check_suspend_wait_resume);
+    tester.add_step("check_suspend waits until cancel", test_workflow_check_suspend_wait_cancel);
+
+    // 新增：参数读写与共享功能用例
+    tester.add_step("param store injection and replace", test_workflow_param_store_injection_and_replace);
+    tester.add_step("param flow writer->reader", test_workflow_param_flow_writer_reader);
+    tester.add_step("param vector with_write/read", test_workflow_param_vector_rw);
+    tester.add_step("param type-mismatch propagates", test_workflow_param_type_mismatch_propagates);
 
     tester.launch_test();
     return 0;

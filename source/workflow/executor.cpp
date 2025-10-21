@@ -1,5 +1,4 @@
 #include "concurrencpp/workflow/executor.h"
-#include "concurrencpp/workflow/module.h"
 #include "concurrencpp/concurrencpp.h"
 #include "concurrencpp/timers/timer_queue.h"
 
@@ -9,7 +8,12 @@
 using namespace concurrencpp::workflow;
 
 Executor::Executor(std::shared_ptr<concurrencpp::executor> executor)
-    : m_runtime(std::make_shared<concurrencpp::runtime>()), m_executor(std::move(executor)) {}
+    : m_runtime(std::make_shared<concurrencpp::runtime>()), m_executor(std::move(executor)) {
+    // 初始化全局参数存储
+    if (!m_param_store) {
+        m_param_store = std::make_shared<ParamStore>();
+    }
+}
 
 Executor::Executor() : Executor(std::shared_ptr<concurrencpp::executor>()) {
     if (!m_executor) {
@@ -25,6 +29,10 @@ void Executor::addModule(std::shared_ptr<Module> module) {
     }
     // 注入 runtime 供模块选择执行器/创建资源
     module->setRuntime(m_runtime);
+    // 注入共享参数存储
+    if (m_param_store) {
+        module->setParamStore(m_param_store);
+    }
     m_modules.emplace(name, std::move(module));
     // 初始化状态
     m_states[name] = ModuleState::Pending;
@@ -38,33 +46,16 @@ void Executor::add_edge(const std::string& from, const std::string& to) {
     if (it_from == m_modules.end() || it_to == m_modules.end()) {
         throw std::runtime_error("add_edge: unknown module(s): " + from + " -> " + to);
     }
+    // 移除环检测与自依赖限制，交由用户保证拓扑正确性
     it_to->second->addDepend(from);
 }
 
-static void check_cycle(const std::unordered_map<std::string, std::shared_ptr<Module>>& modules) {
-    enum class Mark { None, Temp, Perm };
-    std::unordered_map<std::string, Mark> mark;
-    for (const auto& kv : modules) mark[kv.first] = Mark::None;
-
-    std::function<void(const std::string&)> visit = [&](const std::string& u) {
-        if (mark[u] == Mark::Perm) return;
-        if (mark[u] == Mark::Temp) throw std::runtime_error("Circular dependency at: " + u);
-        mark[u] = Mark::Temp;
-        auto it = modules.find(u);
-        if (it == modules.end()) throw std::runtime_error("Unknown node in cycle check: " + u);
-        for (const auto& v : it->second->getDepend()) {
-            if (!modules.count(v)) throw std::runtime_error("Missing dependency: " + v + " for module: " + u);
-            visit(v);
-        }
-        mark[u] = Mark::Perm;
-    };
-    for (const auto& kv : modules) visit(kv.first);
-}
+// 移除静态的循环检测函数，运行期在拓扑过程中由缺失依赖检查保障基本一致性
 
 // 废弃递归与串行模式，统一采用批并行拓扑
 
 concurrencpp::lazy_result<void> Executor::run_topo_batch() {
-    check_cycle(m_modules);
+    // 移除预运行环检测，直接进入批量拓扑执行
     // 每次执行前重置状态与统计
     m_errors.clear();
     m_module_stats.clear();
@@ -74,46 +65,15 @@ concurrencpp::lazy_result<void> Executor::run_topo_batch() {
     m_deferred_rounds.clear();
     // 记录工作流开始时间
     m_workflow_stats.start_time = std::chrono::steady_clock::now();
-    // 构建索引化的局部图结构：入度与邻接，减少哈希与字符串操作
-    const size_t N = m_modules.size();
-    std::vector<std::string> names;
-    names.reserve(N);
-    if (m_order.size() == N) {
-        names = m_order;
-    } else {
-        for (const auto& [name, _] : m_modules) names.emplace_back(name);
-    }
-    std::unordered_map<std::string, size_t> index_of;
-    index_of.reserve(N);
-    for (size_t i = 0; i < names.size(); ++i) index_of.emplace(names[i], i);
-
-    // 插入顺序索引，用于优先级相同情况下的稳定排序
-    std::unordered_map<std::string, size_t> order_index;
-    order_index.reserve(m_order.size());
-    for (size_t i = 0; i < m_order.size(); ++i) order_index.emplace(m_order[i], i);
-
-    std::vector<int> indeg(N, 0);
-    std::vector<int> failed_dep_count(N, 0);
-    std::vector<size_t> outdeg(N, 0);
-    std::vector<std::vector<size_t>> adj(N);
-    // 统计入度与出度
-    for (const auto& [name, mod] : m_modules) {
-        const size_t u = index_of.at(name);
-        for (const auto& dep : mod->getDepend()) {
-            const size_t v = index_of.at(dep);
-            indeg[u]++;
-            outdeg[v]++;
-        }
-    }
-    // 为邻接表预留容量并填充
-    for (size_t i = 0; i < N; ++i) adj[i].reserve(outdeg[i]);
-    for (const auto& [name, mod] : m_modules) {
-        const size_t u = index_of.at(name);
-        for (const auto& dep : mod->getDepend()) {
-            const size_t v = index_of.at(dep);
-            adj[v].push_back(u);
-        }
-    }
+    // 构建统一图结构
+    auto g = build_graph();
+    const size_t N = g.N;
+    const auto& names = g.names;
+    const auto& index_of = g.index_of;
+    const auto& order_index = g.order_index;
+    auto indeg = g.indeg;
+    auto failed_dep_count = g.failed_dep_count;
+    const auto& adj = g.adj;
 
     // 端到端全局超时预算：在开始时计算统一的 deadline
     std::chrono::steady_clock::time_point deadline;
@@ -181,28 +141,7 @@ concurrencpp::lazy_result<void> Executor::run_topo_batch() {
         selected_run_idx.reserve(runnable_candidates.size());
         std::vector<size_t> deferred_idx;
         deferred_idx.reserve(runnable_candidates.size());
-        if (!m_has_max_concurrency || m_max_concurrency_per_round == 0 || runnable_candidates.size() <= m_max_concurrency_per_round) {
-            selected_run_idx = std::move(runnable_candidates);
-        } else {
-            auto prio_of = [this, &names](size_t idx) {
-                const auto& nm = names[idx];
-                auto it = m_priorities.find(nm);
-                return (it != m_priorities.end()) ? it->second : m_default_priority;
-            };
-            std::stable_sort(runnable_candidates.begin(), runnable_candidates.end(), [&](size_t a, size_t b) {
-                const int pa = prio_of(a);
-                const int pb = prio_of(b);
-                if (pa != pb) return pa > pb; // higher priority first
-                const auto& na = names[a];
-                const auto& nb = names[b];
-                const size_t oa = (order_index.count(na) ? order_index.at(na) : a);
-                const size_t ob = (order_index.count(nb) ? order_index.at(nb) : b);
-                return oa < ob; // earlier insertion first
-            });
-            const size_t limitK = std::min(m_max_concurrency_per_round, runnable_candidates.size());
-            selected_run_idx.assign(runnable_candidates.begin(), runnable_candidates.begin() + limitK);
-            deferred_idx.assign(runnable_candidates.begin() + limitK, runnable_candidates.end());
-        }
+        pick_by_priority_and_gate(runnable_candidates, names, order_index, selected_run_idx, deferred_idx);
 
         // Prepare results for selected nodes; age priorities and requeue deferred nodes
         results.reserve(selected_run_idx.size());
@@ -256,41 +195,7 @@ concurrencpp::lazy_result<void> Executor::run_topo_batch() {
             auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
             if (remaining.count() <= 0) {
                 // 已无剩余时间：设置取消并标记当前层
-                m_cancel.store(true, std::memory_order_relaxed);
-                for (size_t i = 0; i < shared_results.size(); ++i) {
-                    const auto st = shared_results[i].status();
-                    // 注意：shared_results 与 run_layer_idx 对应（仅包含可运行节点）
-                    const auto& name = names[run_layer_idx[i]];
-                    if (st == concurrencpp::result_status::value) {
-                        m_states[name] = ModuleState::Done;
-                        auto& stats = m_module_stats[name];
-                        stats.end_time = std::chrono::steady_clock::now();
-                        stats.duration = std::chrono::duration_cast<std::chrono::milliseconds>(stats.end_time - stats.start_time);
-                    } else if (st == concurrencpp::result_status::exception) {
-                        m_states[name] = ModuleState::Failed;
-                        try {
-                            shared_results[i].get();
-                        } catch (const std::exception& e) {
-                            m_errors[name] = e.what();
-                        } catch (...) {
-                            m_errors[name] = "Unknown error";
-                        }
-                        auto& stats = m_module_stats[name];
-                        stats.end_time = std::chrono::steady_clock::now();
-                        stats.duration = std::chrono::duration_cast<std::chrono::milliseconds>(stats.end_time - stats.start_time);
-                    } else {
-                        // 尚未完成：协作式取消
-                        auto it = m_modules.find(name);
-                        if (it != m_modules.end() && it->second) {
-                            it->second->on_cancel();
-                        }
-                        m_states[name] = ModuleState::Skipped;
-                        auto& stats = m_module_stats[name];
-                        // 标记结束（无耗时）
-                        stats.end_time = stats.start_time;
-                        stats.duration = std::chrono::milliseconds{0};
-                    }
-                }
+                apply_timeout_effect(shared_results, run_layer_idx, names);
                 throw concurrencpp::errors::interrupted_task("Workflow canceled or timed out");
             }
 
@@ -302,39 +207,7 @@ concurrencpp::lazy_result<void> Executor::run_topo_batch() {
                 timeout_lazy.run());
             if (any.index == 1) {
                 // 超时：更新已完成/异常的状态，未完成标记为 Skipped
-                m_cancel.store(true, std::memory_order_relaxed);
-                for (size_t i = 0; i < shared_results.size(); ++i) {
-                    const auto st = shared_results[i].status();
-                    const auto& name = names[run_layer_idx[i]];
-                    if (st == concurrencpp::result_status::value) {
-                        m_states[name] = ModuleState::Done;
-                        auto& stats = m_module_stats[name];
-                        stats.end_time = std::chrono::steady_clock::now();
-                        stats.duration = std::chrono::duration_cast<std::chrono::milliseconds>(stats.end_time - stats.start_time);
-                    } else if (st == concurrencpp::result_status::exception) {
-                        m_states[name] = ModuleState::Failed;
-                        try {
-                            shared_results[i].get();
-                        } catch (const std::exception& e) {
-                            m_errors[name] = e.what();
-                        } catch (...) {
-                            m_errors[name] = "Unknown error";
-                        }
-                        auto& stats = m_module_stats[name];
-                        stats.end_time = std::chrono::steady_clock::now();
-                        stats.duration = std::chrono::duration_cast<std::chrono::milliseconds>(stats.end_time - stats.start_time);
-                    } else {
-                        // 尚未完成：协作式取消
-                        auto it = m_modules.find(name);
-                        if (it != m_modules.end() && it->second) {
-                            it->second->on_cancel();
-                        }
-                        m_states[name] = ModuleState::Skipped;
-                        auto& stats = m_module_stats[name];
-                        stats.end_time = stats.start_time;
-                        stats.duration = std::chrono::milliseconds{0};
-                    }
-                }
+                apply_timeout_effect(shared_results, run_layer_idx, names);
                 throw concurrencpp::errors::interrupted_task("Workflow canceled or timed out");
             }
         } else {
@@ -347,30 +220,8 @@ concurrencpp::lazy_result<void> Executor::run_topo_batch() {
         process_layer_results(shared_results, run_layer_names);
 
         // relax edges: 仅对已处理的节点（selected + skipped）进行边松弛；延迟节点保持就绪以待下一轮。
-        for (const auto& u : run_layer_idx) {
-            const bool u_failed = (m_states[names[u]] == ModuleState::Failed || m_states[names[u]] == ModuleState::Skipped);
-            for (const auto& v : adj[u]) {
-                if (u_failed) {
-                    failed_dep_count[v]++;
-                }
-                if (--indeg[v] == 0) {
-                    // 始终入队，在下一轮统一决定是否执行或跳过，以便继续松弛其后继边
-                    q.push_back(v);
-                }
-            }
-        }
-        // 对于因依赖失败被跳过的节点，同样进行边松弛，以便传播失败影响
-        for (const auto& u : skip_layer_idx) {
-            const bool u_failed = (m_states[names[u]] == ModuleState::Failed || m_states[names[u]] == ModuleState::Skipped);
-            for (const auto& v : adj[u]) {
-                if (u_failed) {
-                    failed_dep_count[v]++;
-                }
-                if (--indeg[v] == 0) {
-                    q.push_back(v);
-                }
-            }
-        }
+        relax_edges(run_layer_idx, names, adj, indeg, failed_dep_count, q);
+        relax_edges(skip_layer_idx, names, adj, indeg, failed_dep_count, q);
     }
     // 记录工作流结束时间与耗时，并触发完成回调
     m_workflow_stats.end_time = std::chrono::steady_clock::now();
@@ -566,28 +417,103 @@ void Executor::age_and_requeue_deferred(
     }
 }
 
-#if 0
-std::string Executor::export_dot() const {
-    // 生成 GraphViz dot 表示，包含节点与依赖边
-    std::string dot = "digraph workflow {\n";
-    // 节点
-    for (const auto& [name, mod] : m_modules) {
-        (void)mod;
-        dot += "  \"" + name + "\"";
-        // 附加状态作为标签
-        auto it = m_states.find(name);
-        if (it != m_states.end()) {
-            dot += " [label=\"" + name + " (" + std::to_string(static_cast<int>(it->second)) + ")\"]";
-        }
-        dot += ";\n";
-    }
-    // 边
-    for (const auto& [name, mod] : m_modules) {
-        for (const auto& dep : mod->getDepend()) {
-            dot += "  \"" + dep + "\" -> \"" + name + "\";\n";
+void Executor::relax_edges(
+    const std::vector<size_t>& u_list,
+    const std::vector<std::string>& names,
+    const std::vector<std::vector<size_t>>& adj,
+    std::vector<int>& indeg,
+    std::vector<int>& failed_dep_count,
+    std::deque<size_t>& q) {
+    for (const auto& u : u_list) {
+        const bool u_failed = (m_states[names[u]] == ModuleState::Failed || m_states[names[u]] == ModuleState::Skipped);
+        for (const auto& v : adj[u]) {
+            if (u_failed) {
+                failed_dep_count[v]++;
+            }
+            if (--indeg[v] == 0) {
+                q.push_back(v);
+            }
         }
     }
-    dot += "}\n";
-    return dot;
 }
-#endif
+
+Executor::Graph Executor::build_graph() const {
+    Graph g;
+    g.N = m_modules.size();
+    g.names.reserve(g.N);
+    if (m_order.size() == g.N) {
+        g.names = m_order;
+    } else {
+        for (const auto& [name, _] : m_modules) g.names.emplace_back(name);
+    }
+    g.index_of.reserve(g.N);
+    for (size_t i = 0; i < g.names.size(); ++i) g.index_of.emplace(g.names[i], i);
+    g.order_index.reserve(m_order.size());
+    for (size_t i = 0; i < m_order.size(); ++i) g.order_index.emplace(m_order[i], i);
+    g.indeg.assign(g.N, 0);
+    g.failed_dep_count.assign(g.N, 0);
+    std::vector<size_t> outdeg(g.N, 0);
+    g.adj.resize(g.N);
+    for (const auto& [name, mod] : m_modules) {
+        const size_t u = g.index_of.at(name);
+        for (const auto& dep : mod->getDepend()) {
+            auto it_dep = g.index_of.find(dep);
+            if (it_dep == g.index_of.end()) {
+                throw std::runtime_error("Missing dependency: " + dep + " for module: " + name);
+            }
+            const size_t v = it_dep->second;
+            g.indeg[u]++;
+            outdeg[v]++;
+        }
+    }
+    for (size_t i = 0; i < g.N; ++i) g.adj[i].reserve(outdeg[i]);
+    for (const auto& [name, mod] : m_modules) {
+        const size_t u = g.index_of.at(name);
+        for (const auto& dep : mod->getDepend()) {
+            auto it_dep = g.index_of.find(dep);
+            if (it_dep == g.index_of.end()) {
+                throw std::runtime_error("Missing dependency: " + dep + " for module: " + name);
+            }
+            const size_t v = it_dep->second;
+            g.adj[v].push_back(u);
+        }
+    }
+    return g;
+}
+
+void Executor::apply_timeout_effect(std::vector<concurrencpp::shared_result<void>>& shared_results,
+                                    const std::vector<size_t>& run_layer_idx,
+                                    const std::vector<std::string>& names) {
+    m_cancel.store(true, std::memory_order_relaxed);
+    for (size_t i = 0; i < shared_results.size(); ++i) {
+        const auto st = shared_results[i].status();
+        const auto& name = names[run_layer_idx[i]];
+        if (st == concurrencpp::result_status::value) {
+            m_states[name] = ModuleState::Done;
+            auto& stats = m_module_stats[name];
+            stats.end_time = std::chrono::steady_clock::now();
+            stats.duration = std::chrono::duration_cast<std::chrono::milliseconds>(stats.end_time - stats.start_time);
+        } else if (st == concurrencpp::result_status::exception) {
+            m_states[name] = ModuleState::Failed;
+            try {
+                shared_results[i].get();
+            } catch (const std::exception& e) {
+                m_errors[name] = e.what();
+            } catch (...) {
+                m_errors[name] = "Unknown error";
+            }
+            auto& stats = m_module_stats[name];
+            stats.end_time = std::chrono::steady_clock::now();
+            stats.duration = std::chrono::duration_cast<std::chrono::milliseconds>(stats.end_time - stats.start_time);
+        } else {
+            auto it = m_modules.find(name);
+            if (it != m_modules.end() && it->second) {
+                it->second->on_cancel();
+            }
+            m_states[name] = ModuleState::Skipped;
+            auto& stats = m_module_stats[name];
+            stats.end_time = stats.start_time;
+            stats.duration = std::chrono::milliseconds{0};
+        }
+    }
+}

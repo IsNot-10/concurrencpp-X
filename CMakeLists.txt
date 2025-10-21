@@ -32,7 +32,6 @@ set(concurrencpp_sources
         source/threads/thread.cpp
         source/timers/timer.cpp
         source/timers/timer_queue.cpp
-        source/workflow/module.cpp
         source/workflow/executor.cpp)
 
 set(concurrencpp_headers
