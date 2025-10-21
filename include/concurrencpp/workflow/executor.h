@@ -45,20 +45,21 @@ namespace concurrencpp::workflow {
         struct Graph {
             size_t N{0};
             std::vector<std::string> names;
-            std::unordered_map<std::string, size_t> index_of;
-            std::unordered_map<std::string, size_t> order_index;
+            // Removed unused fields to simplify Graph representation
             std::vector<int> indeg;
             std::vector<int> failed_dep_count;
-            std::vector<std::vector<size_t>> adj;
+            std::vector<size_t> adj_data;
+            std::vector<size_t> adj_offset; 
         };
 
-        Graph build_graph() const;
+        const Graph& build_graph() const;
         void apply_timeout_effect(std::vector<concurrencpp::shared_result<void>>& shared_results,
                                   const std::vector<size_t>& run_layer_idx,
                                   const std::vector<std::string>& names);
         void relax_edges(const std::vector<size_t>& u_list,
                          const std::vector<std::string>& names,
-                         const std::vector<std::vector<size_t>>& adj,
+                         const std::vector<size_t>& adj_data,
+                         const std::vector<size_t>& adj_offset,
                          std::vector<int>& indeg,
                          std::vector<int>& failed_dep_count,
                          std::deque<size_t>& q);
@@ -68,10 +69,20 @@ namespace concurrencpp::workflow {
         std::shared_ptr<concurrencpp::executor> m_executor; // 默认使用 runtime 的线程池
         std::shared_ptr<ParamStore> m_param_store; // 全局共享参数存储
 
-        std::unordered_map<std::string, ModuleState> m_states;
+        struct ModuleData {
+            ModuleState state{ModuleState::Pending};
+            ModuleStats stats{};
+            int priority{0};
+            size_t deferred_rounds{0};
+        };
+        std::vector<ModuleData> m_module_data;                    // 连续存储
+        std::unordered_map<std::string, size_t> m_name_to_index;  // 名字到索引映射
         std::unordered_map<std::string, std::string> m_errors;
         // 记录模块插入顺序，保证同层处理的确定性
         std::vector<std::string> m_order;
+        // 图缓存：重复执行相同工作流时复用构建结果
+        mutable bool m_graph_cache_valid {false};
+        mutable Graph m_graph_cache;
 
         // 错误策略：失败时的处理方式
         ErrorPolicy m_error_policy = ErrorPolicy::CancelOnError;
@@ -84,11 +95,8 @@ namespace concurrencpp::workflow {
 
         // 统计信息
         WorkflowStats m_workflow_stats{};
-        std::unordered_map<std::string, ModuleStats> m_module_stats;
 
         // 动态优先级调度配置与状态
-        std::unordered_map<std::string, int> m_priorities; // 模块当前优先级
-        std::unordered_map<std::string, size_t> m_deferred_rounds; // 在就绪层中被延迟的轮数
         int m_default_priority {0};
         int m_aging_step {1}; // 每次延迟增加的优先级步长
         bool m_has_max_concurrency {false};
@@ -112,13 +120,13 @@ namespace concurrencpp::workflow {
 
         // 处理当前层的结果，依据错误策略更新状态与错误
         void process_layer_results(std::vector<concurrencpp::shared_result<void>>& shared_results,
-                                   const std::vector<std::string>& layer);
+                                   const std::vector<size_t>& layer_idx,
+                                   const std::vector<std::string>& names);
 
         // 优先级门控：根据优先级和插入顺序从候选中选择运行与延迟集合
         void pick_by_priority_and_gate(
             const std::vector<size_t>& runnable_candidates,
             const std::vector<std::string>& names,
-            const std::unordered_map<std::string, size_t>& order_index,
             std::vector<size_t>& selected_run_idx,
             std::vector<size_t>& deferred_idx) const;
 
@@ -127,6 +135,9 @@ namespace concurrencpp::workflow {
             const std::vector<size_t>& deferred_idx,
             const std::vector<std::string>& names,
             std::deque<size_t>& q);
+
+        // 批量状态更新（内部优化）
+        void batch_update_states(const std::vector<size_t>& indices, ModuleState new_state);
 
     public:
         explicit Executor(std::shared_ptr<concurrencpp::executor> executor);
@@ -157,13 +168,23 @@ namespace concurrencpp::workflow {
         // 统计接口
         WorkflowStats getWorkflowStats() const { return m_workflow_stats; }
         ModuleStats getModuleStats(const std::string& module_name) const {
-            auto it = m_module_stats.find(module_name);
-            if (it == m_module_stats.end()) {
+            auto it = m_name_to_index.find(module_name);
+            if (it == m_name_to_index.end()) {
                 throw std::runtime_error("Unknown module: " + module_name);
             }
-            return it->second;
+            return m_module_data[it->second].stats;
         }
-        std::unordered_map<std::string, ModuleStats> getAllModuleStats() const { return m_module_stats; }
+        std::unordered_map<std::string, ModuleStats> getAllModuleStats() const {
+            std::unordered_map<std::string, ModuleStats> out;
+            for (size_t i = 0; i < m_order.size(); ++i) {
+                const auto& name = m_order[i];
+                auto it = m_name_to_index.find(name);
+                if (it != m_name_to_index.end()) {
+                    out.emplace(name, m_module_data[it->second].stats);
+                }
+            }
+            return out;
+        }
 
         // 可观测性钩子设置
         void set_on_start(std::function<void(const std::string&)> cb) { m_on_start = std::move(cb); }
@@ -191,10 +212,15 @@ namespace concurrencpp::workflow {
         bool cancel_requested() const { return m_cancel.load(std::memory_order_relaxed); }
 
         // 动态优先级接口
-        void set_module_priority(const std::string& module_name, int priority) { m_priorities[module_name] = priority; }
+        void set_module_priority(const std::string& module_name, int priority) {
+            auto it = m_name_to_index.find(module_name);
+            if (it != m_name_to_index.end() && it->second < m_module_data.size()) {
+                m_module_data[it->second].priority = priority;
+            }
+        }
         int get_module_priority(const std::string& module_name) const {
-            auto it = m_priorities.find(module_name);
-            if (it != m_priorities.end()) return it->second;
+            auto it = m_name_to_index.find(module_name);
+            if (it != m_name_to_index.end() && it->second < m_module_data.size()) return m_module_data[it->second].priority;
             return m_default_priority;
         }
         void set_default_priority(int prio) { m_default_priority = prio; }
@@ -237,7 +263,10 @@ namespace concurrencpp::workflow {
                     for (auto& kv : m_modules) {
                         if (kv.second) {
                             kv.second->on_suspend();
-                            m_states[kv.first] = ModuleState::Suspended;
+                            auto it = m_name_to_index.find(kv.first);
+                            if (it != m_name_to_index.end()) {
+                                m_module_data[it->second].state = ModuleState::Suspended;
+                            }
                         }
                     }
                     break;
@@ -245,10 +274,11 @@ namespace concurrencpp::workflow {
                     for (auto& kv : m_modules) {
                         if (kv.second) {
                             kv.second->on_cancel();
-                            // 不覆盖已完成模块状态
-                            auto it = m_states.find(kv.first);
-                            if (it == m_states.end() || it->second != ModuleState::Done) {
-                                m_states[kv.first] = ModuleState::Canceled;
+                            auto it = m_name_to_index.find(kv.first);
+                            if (it != m_name_to_index.end()) {
+                                if (m_module_data[it->second].state != ModuleState::Done) {
+                                    m_module_data[it->second].state = ModuleState::Canceled;
+                                }
                             }
                         }
                     }
@@ -257,10 +287,11 @@ namespace concurrencpp::workflow {
                     for (auto& kv : m_modules) {
                         if (kv.second) {
                             kv.second->on_resume();
-                            // 从 Suspended 恢复到 Pending
-                            auto it = m_states.find(kv.first);
-                            if (it == m_states.end() || it->second == ModuleState::Suspended) {
-                                m_states[kv.first] = ModuleState::Pending;
+                            auto it = m_name_to_index.find(kv.first);
+                            if (it != m_name_to_index.end()) {
+                                if (m_module_data[it->second].state == ModuleState::Suspended) {
+                                    m_module_data[it->second].state = ModuleState::Pending;
+                                }
                             }
                         }
                     }

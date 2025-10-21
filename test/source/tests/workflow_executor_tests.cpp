@@ -3,8 +3,7 @@
 #include "infra/tester.h"
 #include "infra/assertions.h"
 
-#include "concurrencpp/workflow/module.h"
-#include "concurrencpp/workflow/executor.h"
+#include "concurrencpp/workflow/workflow.h"
 #include <algorithm>
 #include <random>
 #include <unordered_map>

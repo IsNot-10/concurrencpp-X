@@ -15,6 +15,5 @@
 #include <utility>
 
 // 说明：本头文件作为聚合入口，仅提供模块与执行器的统一包含。
-// 之前提供的版本常量与创建便捷函数未在代码中使用，已移除以减少冗余。
 
 #endif // CONCURRENCPP_WORKFLOW_H

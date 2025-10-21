@@ -11,6 +11,7 @@
 #include <utility>
 #include <type_traits>
 #include <vector>
+#include "concurrencpp/threads/cache_line.h"
 
 namespace concurrencpp::workflow {
 
@@ -21,7 +22,7 @@ namespace concurrencpp::workflow {
             std::shared_ptr<void> ptr;
             std::type_index type{typeid(void)};
         };
-        struct Shard {
+        struct alignas(CRCPP_CACHE_LINE_ALIGNMENT) Shard {
             std::unordered_map<std::string, Entry> map;
             mutable std::shared_mutex mutex;
         };
