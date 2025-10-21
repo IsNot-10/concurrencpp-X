@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <coroutine>
-#include "concurrencpp/net/asio/asio.hpp"
+#include "concurrencpp/net/asio.hpp"
 
 namespace concurrencpp::net {
 
@@ -83,83 +83,7 @@ public:
     }
 };
 
-// Asio 执行器适配器
-class AsioExecutor : public concurrencpp::derivable_executor<AsioExecutor> {
-private:
-    asio::io_context &executor_;
 
-public:
-    AsioExecutor(asio::io_context &executor, std::string_view name = "asio_executor") 
-        : concurrencpp::derivable_executor<AsioExecutor>(name), executor_(executor) {}
-
-    // 获取当前线程的 io_context 指针
-    static asio::io_context **get_current() {
-        static thread_local asio::io_context *current = nullptr;
-        return &current;
-    }
-    
-    // 设置当前线程的 io_context 指针
-    static void set_current(asio::io_context *ctx) {
-        *get_current() = ctx;
-    }
-
-    // 实现 concurrencpp::executor 接口
-    void enqueue(concurrencpp::task task) override {
-        asio::dispatch(executor_, [task = std::move(task), this]() mutable {
-            // 设置当前线程的io_context指针
-            auto current_ptr = get_current();
-            auto old_value = *current_ptr;
-            *current_ptr = &executor_;
-            
-            // 执行任务
-            task();
-            
-            // 恢复原来的io_context指针
-            *current_ptr = old_value;
-        });
-    }
-
-    void enqueue(std::span<concurrencpp::task> tasks) override {
-        // 批量处理：将多个任务打包成一个任务提交
-        if (tasks.size() == 1) {
-            enqueue(std::move(tasks[0]));
-        } else {
-            asio::dispatch(executor_, [tasks = std::vector<concurrencpp::task>(tasks.begin(), tasks.end()), this]() mutable {
-                // 设置当前线程的io_context指针
-                auto current_ptr = get_current();
-                auto old_value = *current_ptr;
-                *current_ptr = &executor_;
-                
-                // 批量执行所有任务
-                for (auto& task : tasks) {
-                    if (task) {
-                        task();
-                    }
-                }
-                
-                // 恢复原来的io_context指针
-                *current_ptr = old_value;
-            });
-        }
-    }
-
-    int max_concurrency_level() const noexcept override {
-        return 1; // 每个 io_context 通常由一个线程驱动
-    }
-
-    bool shutdown_requested() const override {
-        return false; // 由外部管理 io_context 的生命周期
-    }
-
-    void shutdown() override {
-        // 由外部管理 io_context 的生命周期
-    }
-
-    bool currentThreadInExecutor() const {
-        auto ctx = get_current();
-        return *ctx == &executor_;
-    }
-};
 
 // Asio 回调等待器 - 用于将 asio 的回调风格 API 转换为协程
 // 支持返回特定类型的结果
