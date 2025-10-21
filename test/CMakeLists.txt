@@ -138,6 +138,9 @@ add_test(NAME async_condition_variable_tests PATH source/tests/async_condition_v
 add_test(NAME timer_queue_tests PATH source/tests/timer_tests/timer_queue_tests.cpp)
 add_test(NAME timer_tests PATH source/tests/timer_tests/timer_tests.cpp)
 
+# Workflow executor tests
+add_test(NAME workflow_executor_tests PATH source/tests/workflow_executor_tests.cpp)
+
 if(NOT ENABLE_THREAD_SANITIZER)
   return()
 endif()

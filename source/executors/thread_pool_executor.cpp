@@ -533,7 +533,10 @@ thread_pool_executor::thread_pool_executor(std::string_view pool_name,
     }
 }
 
-thread_pool_executor::~thread_pool_executor() = default;
+thread_pool_executor::~thread_pool_executor() {
+    // Ensure all worker threads are joined to avoid std::terminate
+    shutdown();
+}
 
 void thread_pool_executor::find_idle_workers(size_t caller_index, std::vector<size_t>& buffer, size_t max_count) noexcept {
     m_idle_workers.find_idle_workers(caller_index, buffer, max_count);
