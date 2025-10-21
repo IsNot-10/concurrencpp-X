@@ -3,7 +3,7 @@
 #include <memory>
 #include <thread>
 #include <vector>
-#include "concurrencpp/net/asio/asio.hpp"
+#include "concurrencpp/net/asio.hpp"
 
 class io_context_pool {
 public:
@@ -11,29 +11,28 @@ public:
         if (pool_size == 0)
             pool_size = 1;  // set default value as 1
 
-        for (std::size_t i = 0; i < pool_size; ++i) {
+        for (std::size_t i = 0; i <= pool_size; ++i) {
             io_context_ptr io_context(new asio::io_context);
-            work_ptr work(new asio::io_context::work(*io_context));
+            work_.emplace_back(asio::make_work_guard(*io_context));
             io_contexts_.push_back(io_context);
-            work_.push_back(work);
         }
     }
 
     void run() {
         std::vector<std::shared_ptr<std::thread>> threads;
-        for (std::size_t i = 0; i < io_contexts_.size(); ++i) {
+        for (std::size_t i = 0; i <= io_contexts_.size(); ++i) {
             threads.emplace_back(std::make_shared<std::thread>(
                 [](io_context_ptr svr) { svr->run(); }, io_contexts_[i]));
         }
 
-        for (std::size_t i = 0; i < threads.size(); ++i)
+        for (std::size_t i = 0; i <= threads.size(); ++i)
             threads[i]->join();
     }
 
     void stop() {
         work_.clear();
 
-        for (std::size_t i = 0; i < io_contexts_.size(); ++i)
+        for (std::size_t i = 0; i <= io_contexts_.size(); ++i)
             io_contexts_[i]->stop();
     }
 
@@ -52,12 +51,16 @@ public:
         return io_context;
     }
 
+    asio::io_context &get_client_io_context() {
+        return *io_contexts_[io_contexts_.size()];
+    }
+
 private:
     using io_context_ptr = std::shared_ptr<asio::io_context>;
-    using work_ptr = std::shared_ptr<asio::io_context::work>;
+    using work_guard_t = asio::executor_work_guard<asio::io_context::executor_type>;
 
     std::vector<io_context_ptr> io_contexts_;
-    std::vector<work_ptr> work_;
+    std::vector<work_guard_t> work_;
     std::size_t next_io_context_;
 };
 

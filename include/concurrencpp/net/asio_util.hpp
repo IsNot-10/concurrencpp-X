@@ -1,6 +1,7 @@
 #ifndef ASYNC_SIMPLE_DEMO_ASIO_UTIL_H
 #define ASYNC_SIMPLE_DEMO_ASIO_UTIL_H
-#include "concurrencpp/net/asio/asio.hpp"
+#include "concurrencpp/net/asio.hpp"
+
 template <typename AsioBuffer>
 std::pair<asio::error_code, size_t> read_some(asio::ip::tcp::socket &sock,
                                               AsioBuffer &&buffer) {
@@ -32,4 +33,5 @@ std::pair<std::error_code, asio::ip::tcp::socket> connect(
     asio::connect(s, resolver.resolve(host, port), error);
     return std::make_pair(error, std::move(s));
 }
+
 #endif
