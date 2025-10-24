@@ -20,4 +20,9 @@
 #include "concurrencpp/threads/async_lock.h"
 #include "concurrencpp/threads/async_condition_variable.h"
 
+#include "concurrencpp/net/server.hpp"
+#include "concurrencpp/net/client.hpp"
+#include "concurrencpp/net/http/http_server.hpp"
+#include "concurrencpp/net/http/http_client.hpp"
+
 #endif

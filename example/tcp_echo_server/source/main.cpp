@@ -6,7 +6,6 @@
 #include <chrono>
 
 #include "concurrencpp/concurrencpp.h"
-#include "concurrencpp/net/server.hpp"
 
 using concurrencpp::lazy_result;
 namespace net = concurrencpp::net;
@@ -21,13 +20,14 @@ int main(int argc, char** argv) {
     std::cout << "Press Ctrl+C to exit" << std::endl;
 
     try {
-        net::tcp_server server(port);
+        concurrencpp::runtime rt;
 
-        
-        // 启动服务器（阻塞直到接收循环结束；Ctrl+C 触发优雅关闭）
+        auto& pool = rt.net_io_pool();
+
+        net::tcp_server server(pool, port);
+
         auto server_result = server.start().run();
         server_result.wait();
-        
 
         std::cout << "Server stopped." << std::endl;
     } catch (const std::exception& e) {

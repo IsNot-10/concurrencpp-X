@@ -61,7 +61,8 @@ runtime_options::runtime_options() noexcept :
     max_thread_pool_executor_waiting_time(details::k_default_max_worker_wait_time),
     max_background_threads(details::default_max_background_workers()),
     max_background_executor_waiting_time(details::k_default_max_worker_wait_time),
-    max_timer_queue_waiting_time(std::chrono::seconds(details::consts::k_max_timer_queue_worker_waiting_time_sec)) {}
+    max_timer_queue_waiting_time(std::chrono::seconds(details::consts::k_max_timer_queue_worker_waiting_time_sec)),
+    net_io_pool_threads(details::consts::k_net_io_pool_threads) {}
 
 /*
         runtime
@@ -94,12 +95,24 @@ runtime::runtime(const runtime_options& options) {
     m_thread_executor =
         std::make_shared<::concurrencpp::thread_executor>(options.thread_started_callback, options.thread_terminated_callback);
     m_registered_executors.register_executor(m_thread_executor);
+
+    // 初始化 io_context_pool 并启动专用线程组
+    m_net_io_pool = std::make_unique<::io_context_pool>(options.net_io_pool_threads);
+    m_net_io_pool_runner = std::thread([this] {
+        m_net_io_pool->run();
+    });
 }
 
 concurrencpp::runtime::~runtime() noexcept {
     try {
         m_timer_queue->shutdown();
         m_registered_executors.shutdown_all();
+        if (m_net_io_pool) {
+            m_net_io_pool->stop();
+        }
+        if (m_net_io_pool_runner.joinable()) {
+            m_net_io_pool_runner.join();
+        }
 
     } catch (...) {
         std::abort();
