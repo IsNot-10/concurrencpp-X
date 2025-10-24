@@ -88,10 +88,17 @@ set(concurrencpp_headers
 add_library(concurrencpp ${concurrencpp_headers} ${concurrencpp_sources})
 add_library(concurrencpp::concurrencpp ALIAS concurrencpp)
 
+# Ensure ASIO wrapper and upstream headers are discoverable when building the library
+# - wrappers live under include/concurrencpp/net/asio
+# - upstream ASIO headers live under asio/asio/include
+# Adding both paths ensures headers that do `#include "asio/..."` resolve correctly.
+
 target_include_directories(concurrencpp
         ${concurrencpp_warning_guard}
         PUBLIC
-        "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>")
+        "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
+        "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include/concurrencpp/net>"
+        "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/asio/asio/include>")
 
 target_compile_features(concurrencpp PUBLIC cxx_std_20)
 

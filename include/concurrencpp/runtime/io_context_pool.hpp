@@ -11,7 +11,7 @@ public:
         if (pool_size == 0)
             pool_size = 1;  // set default value as 1
 
-        for (std::size_t i = 0; i <= pool_size; ++i) {
+        for (std::size_t i = 0; i < pool_size; ++i) {
             io_context_ptr io_context(new asio::io_context);
             work_.emplace_back(asio::make_work_guard(*io_context));
             io_contexts_.push_back(io_context);
@@ -20,19 +20,19 @@ public:
 
     void run() {
         std::vector<std::shared_ptr<std::thread>> threads;
-        for (std::size_t i = 0; i <= io_contexts_.size(); ++i) {
+        for (std::size_t i = 0; i < io_contexts_.size(); ++i) {
             threads.emplace_back(std::make_shared<std::thread>(
                 [](io_context_ptr svr) { svr->run(); }, io_contexts_[i]));
         }
 
-        for (std::size_t i = 0; i <= threads.size(); ++i)
+        for (std::size_t i = 0; i < threads.size(); ++i)
             threads[i]->join();
     }
 
     void stop() {
         work_.clear();
 
-        for (std::size_t i = 0; i <= io_contexts_.size(); ++i)
+        for (std::size_t i = 0; i < io_contexts_.size(); ++i)
             io_contexts_[i]->stop();
     }
 
@@ -52,7 +52,7 @@ public:
     }
 
     asio::io_context &get_client_io_context() {
-        return *io_contexts_[io_contexts_.size()];
+        return *io_contexts_.back();
     }
 
 private:

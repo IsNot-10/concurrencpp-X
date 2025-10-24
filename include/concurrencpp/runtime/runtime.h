@@ -4,12 +4,14 @@
 #include "concurrencpp/runtime/constants.h"
 #include "concurrencpp/forward_declarations.h"
 #include "concurrencpp/platform_defs.h"
+#include "concurrencpp/runtime/io_context_pool.hpp"
 
 #include <memory>
 #include <mutex>
 #include <vector>
 #include <chrono>
 #include <functional>
+#include <thread>
 
 namespace concurrencpp::details {
     class CRCPP_API executor_collection {
@@ -34,6 +36,9 @@ namespace concurrencpp {
 
         std::chrono::milliseconds max_timer_queue_waiting_time;
 
+        // 网络 IO 池线程数（io_context_pool 大小）
+        size_t net_io_pool_threads;
+
         std::function<void(std::string_view thread_name)> thread_started_callback;
         std::function<void(std::string_view thread_name)> thread_terminated_callback;
 
@@ -55,6 +60,10 @@ namespace concurrencpp {
 
         std::shared_ptr<concurrencpp::timer_queue> m_timer_queue;
 
+        // io_context_pool 生命周期由 runtime 管理
+        std::unique_ptr<::io_context_pool> m_net_io_pool;
+        std::thread m_net_io_pool_runner;
+
        public:
         runtime();
         runtime(const concurrencpp::runtime_options& options);
@@ -62,6 +71,9 @@ namespace concurrencpp {
         ~runtime() noexcept;
 
         std::shared_ptr<concurrencpp::timer_queue> timer_queue() const noexcept;
+
+        // 提供访问网络 IO 池
+        ::io_context_pool& net_io_pool() const noexcept { return *m_net_io_pool; }
 
         std::shared_ptr<concurrencpp::inline_executor> inline_executor() const noexcept;
         std::shared_ptr<concurrencpp::thread_pool_executor> thread_pool_executor() const noexcept;
