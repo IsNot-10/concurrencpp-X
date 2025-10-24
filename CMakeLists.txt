@@ -31,8 +31,7 @@ set(concurrencpp_sources
         source/threads/async_condition_variable.cpp
         source/threads/thread.cpp
         source/timers/timer.cpp
-        source/timers/timer_queue.cpp
-        source/workflow/executor.cpp)
+        source/timers/timer_queue.cpp)
 
 set(concurrencpp_headers
         include/concurrencpp/concurrencpp.h
@@ -80,10 +79,7 @@ set(concurrencpp_headers
         include/concurrencpp/timers/timer.h
         include/concurrencpp/timers/timer_queue.h
         include/concurrencpp/utils/bind.h
-        include/concurrencpp/utils/slist.h
-        include/concurrencpp/workflow/workflow.h
-        include/concurrencpp/workflow/module.h
-        include/concurrencpp/workflow/executor.h)
+        include/concurrencpp/utils/slist.h)
 
 add_library(concurrencpp ${concurrencpp_headers} ${concurrencpp_sources})
 add_library(concurrencpp::concurrencpp ALIAS concurrencpp)
