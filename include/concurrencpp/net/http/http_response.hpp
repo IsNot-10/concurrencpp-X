@@ -53,7 +53,7 @@ constexpr std::string_view status_line_bad_gateway =
 constexpr std::string_view status_line_service_unavailable =
     "HTTP/1.1 503 Service Unavailable\r\n";
 
-asio::const_buffer status_to_buffer(status_type status) {
+inline asio::const_buffer status_to_buffer(status_type status) {
     switch (status) {
         case status_type::ok:
             return asio::buffer(status_line_ok);
@@ -102,7 +102,7 @@ const std::unordered_map<std::string_view, std::string_view> mime_map = {
     {"jpg", "image/jpeg"},
     {"png", "image/png"}};
 
-std::string_view extension_to_type(std::string_view extension) {
+inline std::string_view extension_to_type(std::string_view extension) {
     if (auto it = mime_map.find(extension); it != mime_map.end()) {
         return it->second;
     }
@@ -114,6 +114,18 @@ std::string_view extension_to_type(std::string_view extension) {
 namespace misc_strings {
 constexpr std::string_view name_value_separator = ": ";
 constexpr std::string_view crlf = "\r\n";
+}
+
+
+namespace http_constants {
+constexpr std::string_view content_type_text = "text/plain";
+constexpr std::string_view content_type_json = "application/json";
+constexpr std::string_view content_type_html = "text/html";
+constexpr std::string_view header_content_length = "Content-Length";
+constexpr std::string_view header_content_type = "Content-Type";
+constexpr std::string_view header_connection = "Connection";
+constexpr std::string_view connection_close = "close";
+constexpr std::string_view connection_keep_alive = "keep-alive";
 }
 
 struct response {
@@ -222,7 +234,7 @@ constexpr std::string_view response_service_unavailable =
     "<body><h1>503 Service Unavailable</h1></body>"
     "</html>";
 
-std::string_view to_string(status_type status) {
+inline std::string_view to_string(status_type status) {
     switch (status) {
         case status_type::ok:
             return response_ok;
@@ -262,16 +274,59 @@ std::string_view to_string(status_type status) {
 }
 }
 
-response build_response(status_type status) {
-    response rep;
-    rep.status = status;
-    rep.content = response_content::to_string(status);
-    rep.headers.resize(2);
-    rep.headers[0].name = "Content-Length";
-    rep.headers[0].value = std::to_string(rep.content.size());
-    rep.headers[1].name = "Content-Type";
-    rep.headers[1].value = "text/html";
-    return rep;
+
+class response_builder {
+public:
+    static response create(status_type status, const std::string& content, std::string_view content_type) {
+        response rep;
+        rep.status = status;
+        rep.content = content;
+        rep.headers.resize(2);
+        rep.headers[0].name = std::string(http_constants::header_content_length);
+        rep.headers[0].value = std::to_string(content.size());
+        rep.headers[1].name = std::string(http_constants::header_content_type);
+        rep.headers[1].value = std::string(content_type);
+        return rep;
+    }
+    
+    static response text(const std::string& content, status_type status = status_type::ok) {
+        return create(status, content, http_constants::content_type_text);
+    }
+    
+    static response json(const std::string& content, status_type status = status_type::ok) {
+        return create(status, content, http_constants::content_type_json);
+    }
+    
+    static response html(const std::string& content, status_type status = status_type::ok) {
+        return create(status, content, http_constants::content_type_html);
+    }
+};
+
+
+inline response create_error_response(status_type status, const std::string& message = "") {
+    if (message.empty()) {
+        return response_builder::html(std::string(response_content::to_string(status)), status);
+    } else {
+        return response_builder::text(message, status);
+    }
+}
+
+
+inline response build_response(status_type status) {
+    return response_builder::html(std::string(response_content::to_string(status)), status);
+}
+
+
+inline response build_text_response(const std::string& content, status_type status = status_type::ok) {
+    return response_builder::text(content, status);
+}
+
+inline response build_json_response(const std::string& content, status_type status = status_type::ok) {
+    return response_builder::json(content, status);
+}
+
+inline response build_html_response(const std::string& content, status_type status = status_type::ok) {
+    return response_builder::html(content, status);
 }
 
 #endif

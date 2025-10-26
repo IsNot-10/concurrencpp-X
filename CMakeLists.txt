@@ -164,5 +164,3 @@ install(
   DESTINATION "${concurrencpp_include_directory}"
   COMPONENT concurrencpp_Development)
 
-# ---- Examples ----
-# workflow 简洁示例统一在 example 子目录中维护，旧的 18_optional_executor_demo 已移除。
